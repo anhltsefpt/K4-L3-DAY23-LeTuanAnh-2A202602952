@@ -29,13 +29,52 @@ URL = {"a": "http://127.0.0.1:8001", "b": "http://127.0.0.1:8002"}
 
 
 def probe(region: str, timeout: float) -> tuple[bool, str]:
-    """TODO: trả về (ready, reason). Timeout PHẢI có — netblock làm request treo mãi."""
-    raise NotImplementedError
+    """Trả về (ready, reason). Timeout PHẢI có — netblock làm request treo mãi."""
+    try:
+        r = httpx.get(f"{URL[region]}/readyz", timeout=timeout)
+    except Exception as e:  # ConnectError (stop) hoặc ReadTimeout (netblock)
+        return False, type(e).__name__
+    if r.status_code == 200:
+        return True, "ready"
+    try:
+        reasons = r.json().get("reasons") or []
+    except ValueError:
+        reasons = []
+    return False, f"http_{r.status_code}:" + ",".join(reasons)
 
 
 def run(interval: float, timeout: float, threshold: int, duration: float, out: pathlib.Path):
-    """TODO: vòng lặp poll + phát hiện transition + ghi JSONL."""
-    raise NotImplementedError
+    """Poll cả 2 region, đổi trạng thái sau `threshold` lần liên tiếp, chỉ log transition."""
+    out.parent.mkdir(parents=True, exist_ok=True)
+    # Giả định ban đầu HEALTHY: 1 lần fail lúc khởi động không được tính là outage.
+    st = {r: {"state": "HEALTHY", "fails": 0, "oks": 0} for r in URL}
+    end = time.time() + duration
+    with out.open("a") as f:
+        def emit(**kw):
+            rec = {"ts": time.time(), "iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+                   **kw}
+            f.write(json.dumps(rec) + "\n")
+            f.flush()
+            print("HEALTH", json.dumps(rec), flush=True)
+
+        emit(event="start", interval_s=interval, threshold=threshold, timeout_s=timeout)
+        while time.time() < end:
+            for region, s in st.items():
+                ok, reason = probe(region, timeout)
+                if ok:
+                    s["oks"], s["fails"] = s["oks"] + 1, 0
+                else:
+                    s["fails"], s["oks"] = s["fails"] + 1, 0
+                if s["state"] == "HEALTHY" and s["fails"] >= threshold:
+                    s["state"] = "UNHEALTHY"
+                elif s["state"] == "UNHEALTHY" and s["oks"] >= threshold:
+                    s["state"] = "HEALTHY"
+                else:
+                    continue
+                emit(event="state_change", region=region, to=s["state"], reason=reason,
+                     consecutive_fails=s["fails"], consecutive_oks=s["oks"],
+                     interval_s=interval, threshold=threshold)
+            time.sleep(interval)
 
 
 if __name__ == "__main__":

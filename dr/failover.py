@@ -35,13 +35,79 @@ LOG = pathlib.Path("reports/failover-events.jsonl")
 
 
 def emit(**kw):
-    """TODO: append 1 dòng JSONL có ts + iso vào LOG, và print ra stdout."""
-    raise NotImplementedError
+    """Append 1 dòng JSONL có ts + iso vào LOG, và print ra stdout."""
+    LOG.parent.mkdir(parents=True, exist_ok=True)
+    rec = {"ts": time.time(), "iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()), **kw}
+    with LOG.open("a") as f:
+        f.write(json.dumps(rec) + "\n")
+    print("FAILOVER", json.dumps(rec), flush=True)
+    return rec
+
+
+def state_of(region: str) -> dict:
+    try:
+        return httpx.get(f"{URL[region]}/v1/state", timeout=2.0).json()
+    except Exception as e:
+        return {"region": region, "error": type(e).__name__}
 
 
 def failover(target: str, backend: str, wait: float) -> dict:
-    """TODO: 5 bước ở trên, đúng thứ tự."""
-    raise NotImplementedError
+    """5 bước ở trên, đúng thứ tự. Trả về dict có `ok` + kết quả từng bước."""
+    source = "b" if target == "a" else "a"
+    t_start = time.time()
+
+    # 1 — trạng thái hiện tại của region đích (thường: rỗng, pool warm)
+    before = state_of(target)
+    emit(step="1_verify_target", target=target, state=before)
+
+    # 2 — restore snapshot + đo RPO thật (primary có mà bản restore không có)
+    try:
+        meta = snapshot.get(target, backend)
+    except SystemExit as e:
+        emit(step="2_restore_snapshot", target=target, ok=False, error=str(e))
+        return {"ok": False, "failed_step": "2_restore_snapshot", "error": str(e)}
+    r = snapshot.rpo(pathlib.Path(f"state/region-{source}/vectors.sqlite"),
+                     pathlib.Path(f"state/region-{target}/vectors.sqlite"))
+    restore = {"rpo_seconds": r["rpo_seconds"], "docs_lost": r["docs_lost"],
+               "embed_model_version": meta.get("embed_model_version"),
+               "snapshot_at": meta.get("snapshot_at")}
+    emit(step="2_restore_snapshot", target=target, backend=backend, **restore)
+
+    # 3 — scale pool warm -> full (bắt đầu GPU warm-up ở serving)
+    pool = pathlib.Path(f"state/region-{target}/pool_state")
+    pool.parent.mkdir(parents=True, exist_ok=True)
+    pool.write_text("full")
+    emit(step="3_scale_pool", target=target, pool_state="full")
+
+    # 4 — chờ /readyz 200. Timeout -> ABORT, tuyệt đối không cutover.
+    t0, last = time.time(), None
+    while True:
+        try:
+            resp = httpx.get(f"{URL[target]}/readyz", timeout=2.0)
+            if resp.status_code == 200:
+                break
+            last = resp.json().get("reasons")
+        except Exception as e:
+            last = type(e).__name__
+        if time.time() - t0 >= wait:
+            emit(step="4_wait_ready", target=target, ok=False,
+                 waited_s=round(time.time() - t0, 2), last=last)
+            emit(step="abort", target=target, reason="target_not_ready -> KHONG cutover")
+            return {"ok": False, "failed_step": "4_wait_ready", "last": last, **restore}
+        time.sleep(0.5)
+    waited = round(time.time() - t0, 2)
+    emit(step="4_wait_ready", target=target, ok=True, waited_s=waited)
+
+    # 5 — chỉ bây giờ mới đổi "DNS"
+    active = pathlib.Path("edge/active_region")
+    active.parent.mkdir(parents=True, exist_ok=True)
+    active.write_text(target)
+    emit(step="5_dns_cutover", target=target, active_region=target)
+
+    after = state_of(target)
+    return {"ok": True, "target": target, "before": before, "after": after,
+            "warmup_waited_s": waited, "elapsed_s": round(time.time() - t_start, 2),
+            **restore}
 
 
 if __name__ == "__main__":
